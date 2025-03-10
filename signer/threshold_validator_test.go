@@ -23,6 +23,7 @@ import (
 	comet "github.com/cometbft/cometbft/types"
 	"github.com/ethereum/go-ethereum/crypto/ecies"
 	"github.com/ethereum/go-ethereum/crypto/secp256k1"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	tsed25519 "gitlab.com/unit410/threshold-ed25519/pkg"
 	"golang.org/x/sync/errgroup"
@@ -635,4 +636,121 @@ func testThresholdValidatorLeaderElection(t *testing.T, threshold, total uint8) 
 
 func TestThresholdValidatorLeaderElection2of3(t *testing.T) {
 	testThresholdValidatorLeaderElection(t, 2, 3)
+}
+
+func TestFailedSignStateAndRestart(t *testing.T) {
+	cosigners, _ := getTestLocalCosigners(t, 2, 3)
+
+	leader := &MockLeader{id: 1}
+
+	validator := NewThresholdValidator(
+		cometlog.NewNopLogger(),
+		cosigners[0].config,
+		2,
+		time.Second,
+		1,
+		cosigners[0],
+		[]Cosigner{cosigners[1], cosigners[2]},
+		leader,
+	)
+
+	leader.leader = validator
+
+	ctx := context.Background()
+
+	err := validator.LoadSignStateIfNecessary(testChainID)
+	require.NoError(t, err)
+
+	proposal := cometproto.Proposal{
+		Height: 1,
+		Round:  20,
+		Type:   cometproto.ProposalType,
+	}
+
+	block := ProposalToBlock(testChainID, &proposal)
+
+	_, _, _, err = validator.Sign(ctx, testChainID, block)
+	require.NoError(t, err)
+
+	blockIDHash := sha256.New()
+	blockIDHash.Write([]byte("something"))
+
+	nonnilprevote := cometproto.Vote{
+		Height:  1,
+		Round:   20,
+		Type:    cometproto.PrevoteType,
+		BlockID: cometproto.BlockID{Hash: blockIDHash.Sum(nil)},
+	}
+	nilprevote := cometproto.Vote{
+		Height: 1,
+		Round:  20,
+		Type:   cometproto.PrevoteType,
+	}
+	nonnilblock := VoteToBlock(testChainID, &nonnilprevote)
+	nilblock := VoteToBlock(testChainID, &nilprevote)
+
+	validator.peerCosigners[1] = &InvalidCosigner{cosigner: cosigners[2]}
+
+	validator.nonceCache.LoadN(ctx, 1)
+	_, _, _, err = validator.FailReturningSign(ctx, testChainID, nonnilblock)
+	require.Error(t, err)
+
+	validator.Stop()
+
+	leader = &MockLeader{id: 2}
+	validator = NewThresholdValidator(
+		cometlog.NewNopLogger(),
+		cosigners[1].config,
+		2,
+		time.Second,
+		1,
+		cosigners[1],
+		[]Cosigner{cosigners[0], cosigners[2]},
+		leader,
+	)
+	defer validator.Stop()
+
+	err = validator.LoadSignStateIfNecessary(testChainID)
+	require.NoError(t, err)
+
+	leader.leader = validator
+
+	validator.nonceCache.LoadN(ctx, 1)
+	_, _, _, err = validator.Sign(ctx, testChainID, nilblock)
+	require.Error(t, err)
+
+	validator.nonceCache.LoadN(ctx, 1)
+
+	_, _, _, err = validator.Sign(ctx, testChainID, nonnilblock)
+	require.NoError(t, err)
+}
+
+type InvalidCosigner struct {
+	cosigner *LocalCosigner
+}
+
+var _ Cosigner = &InvalidCosigner{}
+
+func (c *InvalidCosigner) GetID() int {
+	return c.cosigner.GetID()
+}
+
+func (c *InvalidCosigner) GetAddress() string {
+	return c.cosigner.GetAddress()
+}
+
+func (c *InvalidCosigner) GetPubKey(chainID string) (cometcrypto.PubKey, error) {
+	return c.cosigner.GetPubKey(chainID)
+}
+
+func (c *InvalidCosigner) GetNonces(ctx context.Context, uuids []uuid.UUID) (CosignerUUIDNoncesMultiple, error) {
+	return c.cosigner.GetNonces(ctx, uuids)
+}
+
+func (c *InvalidCosigner) SetNoncesAndSign(ctx context.Context, req CosignerSetNoncesAndSignRequest) (*CosignerSignResponse, error) {
+	return nil, fmt.Errorf("invalid cosigner")
+}
+
+func (c *InvalidCosigner) VerifySignature(chainID string, payload, signature []byte) bool {
+	return c.cosigner.VerifySignature(chainID, payload, signature)
 }

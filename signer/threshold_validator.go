@@ -254,7 +254,6 @@ func (pv *ThresholdValidator) notifyBlockSignError(chainID string, hrs HRSKey, s
 		Round:  hrs.Round,
 		Step:   hrs.Step,
 		// empty signature to indicate error
-		SignBytes: signBytes,
 	}
 	css.lastSignState.mu.Unlock()
 	css.lastSignState.cond.Broadcast()
@@ -439,6 +438,12 @@ func (pv *ThresholdValidator) compareBlockSignatureAgainstSSC(
 		if _, ok := err.(*SameBlockError); !ok {
 			return nil, nil, stamp, err
 		}
+	}
+
+	if existingSignature.SignBytes == nil {
+		// signature is not yet saved, so we can sign again
+		// this indicates that the previous attempt failed
+		return nil, nil, stamp, nil
 	}
 
 	// If a proposal has already been signed for this HRS, or the sign payload is identical, return the existing signature.
@@ -989,4 +994,237 @@ func (pv *ThresholdValidator) Sign(
 	)
 
 	return signature, voteExtSig, stamp, nil
+}
+
+/// This is for testing purpose only
+// will delete this after testing
+
+func (pv *ThresholdValidator) FailReturningSign(
+	ctx context.Context,
+	chainID string,
+	block Block,
+) ([]byte, []byte, time.Time, error) {
+	height, round, step, stamp := block.Height, block.Round, block.Step, block.Timestamp
+	signBytes, voteExtensionSignBytes := block.SignBytes, block.VoteExtensionSignBytes
+
+	log := pv.logger.With(
+		"chain_id", chainID,
+		"height", height,
+		"round", round,
+		"type", signType(step),
+	)
+
+	if err := pv.LoadSignStateIfNecessary(chainID); err != nil {
+		return nil, nil, stamp, err
+	}
+
+	// Only the leader can execute this function. Followers can handle the requests,
+	// but they just need to proxy the request to the raft leader
+	isProxied, proxySig, proxyVoteExtSig, proxyStamp, err := pv.proxyIfNecessary(ctx, chainID, block)
+	if isProxied {
+		return proxySig, proxyVoteExtSig, proxyStamp, err
+	}
+
+	totalRaftLeader.Inc()
+
+	log.Debug("I am the leader. Managing the sign process for this block")
+
+	timeStartSignBlock := time.Now()
+
+	hrst := HRSTKey{
+		Height:    height,
+		Round:     round,
+		Step:      step,
+		Timestamp: stamp.UnixNano(),
+	}
+
+	// Keep track of the last block that we began the signing process for. Only allow one attempt per block
+	existingSignature, existingVoteExtSig, existingTimestamp, err := pv.SaveLastSignedStateInitiated(chainID, &block)
+	if err != nil {
+		return nil, nil, stamp, fmt.Errorf("error saving last sign state initiated: %w", err)
+	}
+	if existingSignature != nil {
+		log.Debug("Returning existing signature", "signature", fmt.Sprintf("%x", existingSignature))
+		return existingSignature, existingVoteExtSig, existingTimestamp, nil
+	}
+
+	numPeers := len(pv.peerCosigners)
+	total := uint8(numPeers + 1)
+
+	peerStartTime := time.Now()
+
+	cosignersOrderedByFastest := pv.cosignerHealth.GetFastest()
+	cosignersForThisBlock := make([]Cosigner, pv.threshold)
+	cosignersForThisBlock[0] = pv.myCosigner
+	copy(cosignersForThisBlock[1:], cosignersOrderedByFastest[:pv.threshold-1])
+
+	var dontIterateFastestCosigners bool
+
+	_, hasVoteExtensions, err := verifySignPayload(chainID, signBytes, voteExtensionSignBytes)
+	if err != nil {
+		pv.notifyBlockSignError(chainID, block.HRSKey(), signBytes)
+		return nil, nil, stamp, fmt.Errorf("failed to verify payload: %w", err)
+	}
+
+	count := 1
+	if hasVoteExtensions {
+		count = 2
+	}
+
+	var voteExtNonces *CosignerUUIDNonces
+	nonces, err := pv.nonceCache.GetNonces(cosignersForThisBlock)
+	if err != nil {
+		var fallbackRes *CosignersAndNonces
+		var fallbackErr error
+
+		fallbackRes, fallbackErr = pv.getNoncesFallback(ctx, count)
+		if fallbackErr != nil {
+			pv.notifyBlockSignError(chainID, block.HRSKey(), signBytes)
+			return nil, nil, stamp, fmt.Errorf("failed to get nonces: %w", errors.Join(err, fallbackErr))
+		}
+
+		cosignersForThisBlock = fallbackRes.Cosigners
+		nonces = fallbackRes.Nonces[0]
+		if hasVoteExtensions {
+			voteExtNonces = fallbackRes.Nonces[1]
+		}
+		dontIterateFastestCosigners = true
+	} else {
+		drainedNonceCache.Set(0)
+	}
+
+	if err == nil && hasVoteExtensions {
+		voteExtNonces, err = pv.nonceCache.GetNonces(cosignersForThisBlock)
+		if err != nil {
+
+			u := uuid.New()
+			var eg errgroup.Group
+			var mu sync.Mutex
+			for _, c := range cosignersForThisBlock {
+				c := c
+				eg.Go(func() error {
+					nonces, err := c.GetNonces(ctx, []uuid.UUID{u})
+					if err != nil {
+						return err
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					if voteExtNonces == nil {
+						voteExtNonces = nonces[0]
+					} else {
+						voteExtNonces.Nonces = append(voteExtNonces.Nonces, nonces[0].Nonces...)
+					}
+					return nil
+				})
+			}
+
+			if fallbackErr := eg.Wait(); fallbackErr != nil {
+				pv.notifyBlockSignError(chainID, block.HRSKey(), signBytes)
+				return nil, nil, stamp, fmt.Errorf("failed to get nonces for vote extensions: %w", errors.Join(err, fallbackErr))
+			}
+		}
+	}
+
+	nextFastestCosignerIndex := pv.threshold - 1
+	var nextFastestCosignerIndexMu sync.Mutex
+	getNextFastestCosigner := func() Cosigner {
+		nextFastestCosignerIndexMu.Lock()
+		defer nextFastestCosignerIndexMu.Unlock()
+		if nextFastestCosignerIndex >= len(cosignersOrderedByFastest) {
+			return nil
+		}
+		cosigner := cosignersOrderedByFastest[nextFastestCosignerIndex]
+		nextFastestCosignerIndex++
+		return cosigner
+	}
+
+	timedSignBlockThresholdLag.Observe(time.Since(timeStartSignBlock).Seconds())
+
+	for _, peer := range pv.peerCosigners {
+		missedNonces.WithLabelValues(peer.GetAddress()).Set(0)
+		timedCosignerNonceLag.WithLabelValues(peer.GetAddress()).Observe(time.Since(peerStartTime).Seconds())
+	}
+
+	cosignersForThisBlockInt := make([]int, len(cosignersForThisBlock))
+
+	for i, cosigner := range cosignersForThisBlock {
+		cosignersForThisBlockInt[i] = cosigner.GetID()
+	}
+
+	// destination for share signatures
+	shareSignatures := make([][]byte, total)
+	voteExtShareSignatures := make([][]byte, total)
+
+	var eg errgroup.Group
+	for _, cosigner := range cosignersForThisBlock {
+		cosigner := cosigner
+		eg.Go(func() error {
+			for cosigner != nil {
+				signCtx, cancel := context.WithTimeout(ctx, pv.grpcTimeout)
+				defer cancel()
+
+				peerStartTime := time.Now()
+
+				sigReq := CosignerSetNoncesAndSignRequest{
+					ChainID:   chainID,
+					Nonces:    nonces.For(cosigner.GetID()),
+					HRST:      hrst,
+					SignBytes: signBytes,
+				}
+
+				if voteExtNonces != nil {
+					sigReq.VoteExtensionSignBytes = voteExtensionSignBytes
+					sigReq.VoteExtensionNonces = voteExtNonces.For(cosigner.GetID())
+				}
+
+				// set peerNonces and sign in single rpc call.
+				sigRes, err := cosigner.SetNoncesAndSign(signCtx, sigReq)
+				if err != nil {
+					log.Error(
+						"Cosigner failed to set nonces and sign",
+						"cosigner", cosigner.GetID(),
+						"err", err.Error(),
+					)
+
+					if strings.Contains(err.Error(), errUnexpectedState) {
+						pv.nonceCache.ClearNonces(cosigner)
+					}
+
+					if cosigner.GetID() == pv.myCosigner.GetID() {
+						return err
+					}
+
+					if c := status.Code(err); c == codes.DeadlineExceeded || c == codes.NotFound || c == codes.Unavailable {
+						pv.cosignerHealth.MarkUnhealthy(cosigner)
+						pv.nonceCache.ClearNonces(cosigner)
+					}
+
+					if dontIterateFastestCosigners {
+						cosigner = nil
+						continue
+					}
+
+					// this will only work if the next cosigner has the nonces we've already decided to use for this block
+					// otherwise the sign attempt will fail
+					cosigner = getNextFastestCosigner()
+					continue
+				}
+
+				if cosigner != pv.myCosigner {
+					timedCosignerSignLag.WithLabelValues(cosigner.GetAddress()).Observe(time.Since(peerStartTime).Seconds())
+				}
+				shareSignatures[cosigner.GetID()-1] = sigRes.Signature
+				voteExtShareSignatures[cosigner.GetID()-1] = sigRes.VoteExtensionSignature
+
+				return nil
+			}
+			return fmt.Errorf("no cosigners available to sign")
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		pv.notifyBlockSignError(chainID, block.HRSKey(), signBytes)
+		return nil, nil, stamp, fmt.Errorf("error from cosigner(s): %s", err)
+	}
+	return nil, nil, stamp, fmt.Errorf("failed to sign")
 }

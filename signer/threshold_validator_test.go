@@ -745,6 +745,8 @@ func TestFailedSignStateAndRestart(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// define invalid cosigner for testing
+
 type InvalidCosigner struct {
 	cosigner *LocalCosigner
 }
@@ -767,7 +769,10 @@ func (c *InvalidCosigner) GetNonces(ctx context.Context, uuids []uuid.UUID) (Cos
 	return c.cosigner.GetNonces(ctx, uuids)
 }
 
-func (c *InvalidCosigner) SetNoncesAndSign(ctx context.Context, req CosignerSetNoncesAndSignRequest) (*CosignerSignResponse, error) {
+func (c *InvalidCosigner) SetNoncesAndSign(
+	ctx context.Context,
+	req CosignerSetNoncesAndSignRequest,
+) (*CosignerSignResponse, error) {
 	res, err := c.cosigner.SetNoncesAndSign(ctx, req)
 	if err != nil {
 		return res, err

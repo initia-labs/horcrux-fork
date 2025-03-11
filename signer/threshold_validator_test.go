@@ -644,6 +644,7 @@ func TestFailedSignStateAndRestart(t *testing.T) {
 
 	leader := &MockLeader{id: 1}
 
+	// 1. create a validator with the first cosigner as the leader
 	validator := NewThresholdValidator(
 		cometlog.NewNopLogger(),
 		cosigners[0].config,
@@ -670,18 +671,21 @@ func TestFailedSignStateAndRestart(t *testing.T) {
 
 	block := ProposalToBlock(testChainID, &proposal)
 
+	// 2. sign a proposal
 	_, _, _, err = validator.Sign(ctx, testChainID, block)
 	require.NoError(t, err)
 
 	blockIDHash := sha256.New()
 	blockIDHash.Write([]byte("something"))
 
+	// prepare non-nil prevote
 	nonnilprevote := cometproto.Vote{
 		Height:  1,
 		Round:   20,
 		Type:    cometproto.PrevoteType,
 		BlockID: cometproto.BlockID{Hash: blockIDHash.Sum(nil)},
 	}
+	// prepare nil prevote
 	nilprevote := cometproto.Vote{
 		Height: 1,
 		Round:  20,
@@ -694,13 +698,14 @@ func TestFailedSignStateAndRestart(t *testing.T) {
 	validator.peerCosigners[0] = &InvalidCosigner{cosigner: cosigners[1]}
 	validator.peerCosigners[1] = &InvalidCosigner{cosigner: cosigners[2]}
 
+	// 3. sign a proposal with non-nil prevote
 	validator.nonceCache.LoadN(ctx, 1)
 	_, _, _, err = validator.Sign(ctx, testChainID, nonnilblock)
 	require.Error(t, err)
 
 	validator.Stop()
 
-	// new validator with the second cosigner as the leader
+	// 4. create a new validator with the second cosigner as the leader
 	leader = &MockLeader{id: 2}
 	validator = NewThresholdValidator(
 		cometlog.NewNopLogger(),
@@ -722,11 +727,18 @@ func TestFailedSignStateAndRestart(t *testing.T) {
 	err = validator.LoadSignStateIfNecessary(testChainID)
 	require.NoError(t, err)
 
+	// 5. sign a proposal with nil prevote
+	//
 	// should fail because the cosigners are already signed with nonnilblock
+	//
+	// At this point, the validator's css.lastSignState.cache entry has a nil signature,
+	// indicating that the previous signing attempt failed. This allows subsequent signing
+	// attempts for the same block.
 	validator.nonceCache.LoadN(ctx, 1)
 	_, _, _, err = validator.Sign(ctx, testChainID, nilblock)
 	require.Error(t, err)
 
+	// 6. sign a proposal with non-nil prevote
 	// should succeed
 	validator.nonceCache.LoadN(ctx, 1)
 	_, _, _, err = validator.Sign(ctx, testChainID, nonnilblock)

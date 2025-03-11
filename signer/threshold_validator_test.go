@@ -773,6 +773,7 @@ func (c *InvalidCosigner) SetNoncesAndSign(ctx context.Context, req CosignerSetN
 		return res, err
 	}
 
+	// to mimic the unexpected termination of the validator
 	res.Signature = bytes.Repeat([]byte{0}, 32)
 	return res, nil
 }

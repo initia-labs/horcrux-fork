@@ -441,6 +441,11 @@ func (pv *ThresholdValidator) compareBlockSignatureAgainstSSC(
 		}
 	}
 
+	// empty signature indicates that the previous attempt failed, okay to sign again
+	if existingSignature.Signature == nil {
+		return nil, nil, stamp, nil
+	}
+
 	// If a proposal has already been signed for this HRS, or the sign payload is identical, return the existing signature.
 	if block.Step == stepPropose || bytes.Equal(signBytes, existingSignature.SignBytes) {
 		return existingSignature.Signature, existingSignature.VoteExtensionSignature, block.Timestamp, nil

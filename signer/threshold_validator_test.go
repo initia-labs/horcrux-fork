@@ -639,6 +639,7 @@ func TestThresholdValidatorLeaderElection2of3(t *testing.T) {
 }
 
 func TestFailedSignStateAndRestart(t *testing.T) {
+	ctx := context.Background()
 	cosigners, _ := getTestLocalCosigners(t, 2, 3)
 
 	leader := &MockLeader{id: 1}
@@ -654,10 +655,10 @@ func TestFailedSignStateAndRestart(t *testing.T) {
 		leader,
 	)
 
+	// set the validator as the leader
 	leader.leader = validator
 
-	ctx := context.Background()
-
+	// load the sign state
 	err := validator.LoadSignStateIfNecessary(testChainID)
 	require.NoError(t, err)
 
@@ -689,14 +690,17 @@ func TestFailedSignStateAndRestart(t *testing.T) {
 	nonnilblock := VoteToBlock(testChainID, &nonnilprevote)
 	nilblock := VoteToBlock(testChainID, &nilprevote)
 
+	// change cosigners to invalid
+	validator.peerCosigners[0] = &InvalidCosigner{cosigner: cosigners[1]}
 	validator.peerCosigners[1] = &InvalidCosigner{cosigner: cosigners[2]}
 
 	validator.nonceCache.LoadN(ctx, 1)
-	_, _, _, err = validator.FailReturningSign(ctx, testChainID, nonnilblock)
+	_, _, _, err = validator.Sign(ctx, testChainID, nonnilblock)
 	require.Error(t, err)
 
 	validator.Stop()
 
+	// new validator with the second cosigner as the leader
 	leader = &MockLeader{id: 2}
 	validator = NewThresholdValidator(
 		cometlog.NewNopLogger(),
@@ -708,19 +712,23 @@ func TestFailedSignStateAndRestart(t *testing.T) {
 		[]Cosigner{cosigners[0], cosigners[2]},
 		leader,
 	)
+
 	defer validator.Stop()
 
+	// set the new validator as the leader
+	leader.leader = validator
+
+	// load the sign state again
 	err = validator.LoadSignStateIfNecessary(testChainID)
 	require.NoError(t, err)
 
-	leader.leader = validator
-
+	// should fail because the cosigners are already signed with nonnilblock
 	validator.nonceCache.LoadN(ctx, 1)
 	_, _, _, err = validator.Sign(ctx, testChainID, nilblock)
 	require.Error(t, err)
 
+	// should succeed
 	validator.nonceCache.LoadN(ctx, 1)
-
 	_, _, _, err = validator.Sign(ctx, testChainID, nonnilblock)
 	require.NoError(t, err)
 }
@@ -748,7 +756,13 @@ func (c *InvalidCosigner) GetNonces(ctx context.Context, uuids []uuid.UUID) (Cos
 }
 
 func (c *InvalidCosigner) SetNoncesAndSign(ctx context.Context, req CosignerSetNoncesAndSignRequest) (*CosignerSignResponse, error) {
-	return nil, fmt.Errorf("invalid cosigner")
+	res, err := c.cosigner.SetNoncesAndSign(ctx, req)
+	if err != nil {
+		return res, err
+	}
+
+	res.Signature = bytes.Repeat([]byte{0}, 32)
+	return res, nil
 }
 
 func (c *InvalidCosigner) VerifySignature(chainID string, payload, signature []byte) bool {

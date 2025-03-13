@@ -199,10 +199,29 @@ func (cnc *CosignerNonceCache) getUuids(n int) []uuid.UUID {
 }
 
 func (cnc *CosignerNonceCache) target(noncesPerMinute float64) int {
-	t := int((noncesPerMinute / 60) *
-		((cnc.getNoncesInterval.Seconds() * nonceOverallocation) + cnc.getNoncesTimeout.Seconds()))
+	// Nonces needed per block:
+	// - 1 for proposal
+	// - 1 for prevote
+	// - 1 for precommit
+	// - 1 for vote extension (if enabled)
+	const (
+		noncesPerBlock = 4   // proposal + prevote + precommit + extension
+		blockTime      = 0.5 // block time in seconds
+	)
+
+	// Calculate nonces needed per second based on either:
+	// - Actual usage (noncesPerMinute converted to per second)
+	// - Theoretical usage (noncesPerBlock / blockTime)
+	noncesPerSecond := max(noncesPerMinute/60, float64(noncesPerBlock)/blockTime)
+
+	// Calculate target number of nonces to maintain in cache:
+	// noncesPerSecond * (interval * overallocation + timeout)
+	t := int(noncesPerSecond * ((cnc.getNoncesInterval.Seconds() * nonceOverallocation) +
+		cnc.getNoncesTimeout.Seconds()))
+
+	// Always maintain at least one nonce
 	if t <= 0 {
-		return 1 // always target at least one nonce ready
+		return 1
 	}
 	return t
 }

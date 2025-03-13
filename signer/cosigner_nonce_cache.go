@@ -199,13 +199,27 @@ func (cnc *CosignerNonceCache) getUuids(n int) []uuid.UUID {
 }
 
 func (cnc *CosignerNonceCache) target(noncesPerMinute float64) int {
-	buffer := 60
-	t := int((noncesPerMinute / 60) *
-		((cnc.getNoncesInterval.Seconds() * nonceOverallocation) + cnc.getNoncesTimeout.Seconds()))
-	if t <= 0 {
-		t = 0
-	}
-	return t + buffer
+	// Calculate for 10s window (nonce expiration period)
+	activeBlocksPer10s := 20 // (10 seconds / 0.5 second blocks)
+
+	// Nonces needed per block:
+	// - 1 for proposal
+	// - 1 for prevote
+	// - 1 for precommit
+	// - 1 for vote extension (if enabled)
+	noncesPerBlock := 4 // proposal + prevote + precommit + extension
+
+	// Total nonces needed for 10s window with overallocation
+	activeNoncesPer10s := int(float64(activeBlocksPer10s) *
+		float64(noncesPerBlock) *
+		nonceOverallocation) // Using the standard 1.5 overallocation
+
+	// Calculate based on current usage with buffer (adjusted for 10s window)
+	currentUsageTarget := int((noncesPerMinute / 6) * // Convert per-minute to per-10-seconds
+		((cnc.getNoncesInterval.Seconds() * nonceOverallocation) +
+			cnc.getNoncesTimeout.Seconds()))
+
+	return max(currentUsageTarget, activeNoncesPer10s)
 }
 
 func (cnc *CosignerNonceCache) reconcile(ctx context.Context) {
